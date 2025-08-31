@@ -1,0 +1,18 @@
+# requirements.txt
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary
+alembic
+python-jose[cryptography]
+pydantic[email]
+python-decouple
+redis
+httpx
+numpy
+pandas
+yfinance
+alpha-vantage
+structlog
+pytest
+git+https://github.com/rongardF/tvdatafeed.git

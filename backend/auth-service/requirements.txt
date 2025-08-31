@@ -1,0 +1,19 @@
+# requirements.txt
+fastapi
+uvicorn
+sqlalchemy
+psycopg2-binary
+alembic
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+email-validator
+pydantic[email]
+python-decouple
+redis
+celery
+prometheus-client
+structlog
+pytest
+pytest-asyncio
+httpx

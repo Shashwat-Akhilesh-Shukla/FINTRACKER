@@ -1,0 +1,15 @@
+# requirements.txt
+fastapi
+uvicorn[standard]
+sqlalchemy
+psycopg2-binary
+pydantic[email]
+python-decouple
+redis
+httpx
+feedparser
+beautifulsoup4
+textblob
+vaderSentiment
+celery
+structlog
