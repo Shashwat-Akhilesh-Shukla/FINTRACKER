@@ -22,7 +22,8 @@ app.add_middleware(
 SERVICES = {
     "auth": "http://localhost:8001",
     "portfolio": "http://localhost:8002",
-    "news": "http://localhost:8003"
+    "news": "http://localhost:8003",
+    "quant": "http://localhost:8004"
 }
 
 
@@ -42,6 +43,11 @@ async def portfolio_proxy(request: Request, path: str):
 async def news_proxy(request: Request, path: str):
     """Proxy requests to news service"""
     return await proxy_request(request, "news", path)
+
+@app.api_route("/api/v1/quant/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
+async def quant_proxy(request: Request, path: str):
+    """Proxy requests to quant service"""
+    return await proxy_request(request, "quant", path)
 
 
 async def proxy_request(request: Request, service: str, path: str):
