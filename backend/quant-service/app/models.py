@@ -55,3 +55,33 @@ class Transaction(Base):
     created_at = Column(DateTime)
     
     portfolio = relationship("Portfolio", back_populates="transactions")
+
+
+class MarketData(Base):
+    __tablename__ = "market_data"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String, nullable=False, index=True)
+    date = Column(DateTime, nullable=False, index=True)
+    open = Column(Float)
+    high = Column(Float)
+    low = Column(Float)
+    close = Column(Float)
+    volume = Column(Float)
+    adjusted_close = Column(Float)
+    
+    class Config:
+        indexes = [
+            ("symbol", "date")
+        ]
+
+class SecurityMetadata(Base):
+    __tablename__ = "security_metadata"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String, nullable=False, unique=True, index=True)
+    name = Column(String)
+    sector = Column(String)
+    industry = Column(String)
+    currency = Column(String)
+    last_updated = Column(DateTime, nullable=False)

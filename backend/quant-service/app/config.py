@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     DB_POOL_SIZE: int = 5
     DB_MAX_OVERFLOW: int = 10
     
+    ALPHAVANTAGE_API_KEY: str
+    FINNHUB_API_KEY: str
+
     # CORS
     BACKEND_CORS_ORIGINS: List[str] = ["*"]
     

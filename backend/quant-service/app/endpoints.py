@@ -5,15 +5,24 @@ from .database import get_db
 from .analytics import analytics_engine
 from .benchmarks import benchmark_service
 from .schemas import AnalyticsResponse, BenchmarkComparison, HealthResponse, BenchmarkData
-from .models import Portfolio, Transaction
+from .models import Portfolio, Transaction, MarketData, SecurityMetadata
+from .market_data import FinnhubMarketDataService
 from datetime import datetime, timedelta
 import httpx
 from typing import List, Dict
 import yfinance as yf
 import numpy as np
+import logging
 
 router = APIRouter()
 security = HTTPBearer()
+
+# Initialize market data service
+market_data_service = FinnhubMarketDataService()
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Verify token with auth service"""
@@ -22,20 +31,35 @@ async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(s
     except Exception:
         raise HTTPException(status_code=401, detail="Could not validate credentials")
 
+@router.on_event("startup")
+async def startup_event():
+    """Initialize market data service and create tables"""
+    from .database import engine, Base
+    Base.metadata.create_all(bind=engine)
+
 @router.get("/analytics/{user_id}", response_model=AnalyticsResponse)
 async def get_portfolio_analytics(
     user_id: int,
     db: Session = Depends(get_db),
     current_user: dict = Depends(get_current_user)
 ):
-    """Get comprehensive portfolio analytics - ALL REAL CALCULATIONS"""
+    """Get comprehensive portfolio analytics"""
     try:
-        performance_metrics = analytics_engine.calculate_performance_metrics(db, user_id)
-        sector_allocation = analytics_engine.calculate_sector_allocation(db, user_id)
-        correlation_matrix = analytics_engine.calculate_correlation_matrix(db, user_id)
-        diversification_score = analytics_engine.calculate_diversification_score(db, user_id)
+        logger.info(f"Calculating analytics for user {user_id}")
         
-        return AnalyticsResponse(
+        performance_metrics = await analytics_engine.calculate_performance_metrics(db, user_id)
+        logger.info("Performance metrics calculated")
+        
+        sector_allocation = await analytics_engine.calculate_sector_allocation(db, user_id)
+        logger.info("Sector allocation calculated")
+        
+        correlation_matrix = await analytics_engine.calculate_correlation_matrix(db, user_id)
+        logger.info("Correlation matrix calculated")
+        
+        diversification_score = await analytics_engine.calculate_diversification_score(db, user_id)
+        logger.info("Diversification score calculated")
+        
+        response = AnalyticsResponse(
             user_id=user_id,
             performance_metrics=performance_metrics,
             sector_allocation=sector_allocation,
@@ -43,9 +67,16 @@ async def get_portfolio_analytics(
             diversification_score=diversification_score,
             last_updated=datetime.utcnow()
         )
-    
+        
+        logger.info("Analytics response prepared")
+        return response
+        
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Analytics calculation failed: {str(e)}")
+        logger.error(f"Analytics calculation failed: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Analytics calculation failed: {str(e)}"
+        )
 
 @router.get("/benchmark-comparison/{user_id}", response_model=BenchmarkComparison)
 async def get_benchmark_comparison(
@@ -176,3 +207,26 @@ async def health_check():
         service="quant-analytics-service",
         version="1.0.0"
     )
+
+@router.get("/market-data/{symbol}")
+async def get_market_data(
+    symbol: str,
+    days: int = Query(30, gt=0, le=365),
+    db: Session = Depends(get_db)
+):
+    """Get market data with DB caching"""
+    try:
+        data = await market_data_service.get_historical_data(symbol, lookback_days=days)
+        # Cache in DB
+        for date_str, values in data.items():
+            market_data = MarketData(
+                symbol=symbol,
+                date=datetime.strptime(date_str, "%Y-%m-%d"),
+                **values
+            )
+            db.merge(market_data)
+        await db.commit()
+        return data
+    except Exception as e:
+        # Fallback to DB
+        return analytics_engine._get_db_market_data(db, symbol, days)

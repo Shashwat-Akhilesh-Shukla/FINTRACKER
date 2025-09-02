@@ -3,37 +3,36 @@ import pandas as pd
 from typing import List, Dict, Tuple, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import text
-from .models import Portfolio, Holding, Transaction
+from .models import Portfolio, Holding, Transaction, MarketData
 from .schemas import PerformanceMetrics, SectorAllocation, CorrelationMatrix
+from .market_data import FinnhubMarketDataService
 from datetime import datetime, timedelta
-import yfinance as yf
 import asyncio
 
 class AnalyticsEngine:
     def __init__(self):
-        self.risk_free_rate = 0.05  # 5% annual risk-free rate
-        self.market_symbol = "^GSPC"  # S&P 500 as market benchmark
-    
-    def calculate_performance_metrics(self, db: Session, user_id: int) -> PerformanceMetrics:
-        """Calculate all performance metrics for user's portfolio - REAL CALCULATIONS"""
+        self.risk_free_rate = 0.05
+        self.market_symbol = "SPY"
+        self.market_data_service = FinnhubMarketDataService()
+
+    async def calculate_performance_metrics(self, db: Session, user_id: int) -> PerformanceMetrics:
         portfolio = db.query(Portfolio).filter(Portfolio.user_id == user_id).first()
         if not portfolio:
             return self._default_metrics()
         
-        # Get REAL portfolio returns from actual transactions
-        returns = self._calculate_portfolio_returns(db, portfolio.id)
-        if len(returns) < 30:  # Need minimum data points
+        returns = await self._calculate_portfolio_returns(db, portfolio.id)
+        if len(returns) < 30:
             return self._default_metrics()
         
         returns_array = np.array(returns)
         
-        # Calculate ALL metrics with proper formulas
-        sharpe_ratio = self._calculate_sharpe_ratio(returns_array)
-        alpha = self._calculate_alpha(returns_array, portfolio.id)
-        beta = self._calculate_beta(returns_array)
-        volatility = self._calculate_volatility(returns_array)
-        max_drawdown = self._calculate_max_drawdown(returns_array)
-        sortino_ratio = self._calculate_sortino_ratio(returns_array)
+        # Convert methods to be async and await them
+        sharpe_ratio = await self._calculate_sharpe_ratio(returns_array)
+        alpha = await self._calculate_alpha(returns_array, portfolio.id)
+        beta = await self._calculate_beta(returns_array)
+        volatility = await self._calculate_volatility(returns_array)
+        max_drawdown = await self._calculate_max_drawdown(returns_array)
+        sortino_ratio = await self._calculate_sortino_ratio(returns_array)
         
         return PerformanceMetrics(
             sharpe_ratio=sharpe_ratio,
@@ -43,10 +42,9 @@ class AnalyticsEngine:
             max_drawdown=max_drawdown,
             sortino_ratio=sortino_ratio
         )
-    
-    def _calculate_portfolio_returns(self, db: Session, portfolio_id: int) -> List[float]:
+
+    async def _calculate_portfolio_returns(self, db: Session, portfolio_id: int) -> List[float]:
         """REAL CALCULATION: Calculate actual daily portfolio returns from transactions"""
-        # Get all transactions ordered by date
         transactions = db.query(Transaction).filter(
             Transaction.portfolio_id == portfolio_id
         ).order_by(Transaction.transaction_date).all()
@@ -54,9 +52,8 @@ class AnalyticsEngine:
         if len(transactions) < 2:
             return []
         
-        # Build portfolio positions over time
         daily_portfolio_values = {}
-        holdings_tracker = {}  # symbol -> {shares, avg_cost}
+        holdings_tracker = {}
         
         for tx in transactions:
             date_key = tx.transaction_date.date()
@@ -93,15 +90,14 @@ class AnalyticsEngine:
             symbols = list(holdings_tracker.keys())
             
             if symbols:
-                # Get current prices for all symbols
                 try:
-                    current_prices = self._get_current_prices(symbols)
+                    # Use await here
+                    current_prices = await self._get_current_prices(db, symbols)
                     for symbol, position in holdings_tracker.items():
                         if symbol in current_prices and position["shares"] > 0:
                             portfolio_value += position["shares"] * current_prices[symbol]
                 except Exception as e:
                     print(f"Error getting prices: {e}")
-                    # Fallback to cost basis
                     portfolio_value = sum(pos["total_cost"] for pos in holdings_tracker.values())
             
             daily_portfolio_values[date_key] = portfolio_value
@@ -119,22 +115,135 @@ class AnalyticsEngine:
                 returns.append(daily_return)
         
         return returns
+
+    def _store_market_data(self, db: Session, symbol: str, data: Dict[str, Dict]):
+        """Store market data in database"""
+        for date_str, values in data.items():
+            date = datetime.strptime(date_str, "%Y-%m-%d")
+            
+            market_data = MarketData(
+                symbol=symbol,
+                date=date,
+                open=values["open"],
+                high=values["high"],
+                low=values["low"],
+                close=values["close"],
+                volume=values["volume"],
+                adjusted_close=values["adjusted_close"]
+            )
+            
+            db.merge(market_data)  # Use merge to handle updates
+        
+        try:
+            db.commit()
+        except Exception as e:
+            print(f"Error storing market data: {e}")
+            db.rollback()
     
-    def _get_current_prices(self, symbols: List[str]) -> Dict[str, float]:
-        """Get current market prices for symbols"""
+    def _get_historical_prices(self, db: Session, symbol: str, days: int = 365) -> List[Dict]:
+        """Get historical prices, first trying Finnhub then falling back to DB"""
+        try:
+            # Try Finnhub first
+            data = self.market_data_service.get_historical_data(
+                symbol=symbol,
+                interval="D",
+                lookback_days=days
+            )
+            
+            # Store in DB for future use
+            self._store_market_data(db, symbol, data)
+            
+            return data
+            
+        except Exception as e:
+            print(f"Finnhub error for {symbol}: {e}")
+            # Fallback to database
+            return self._get_db_market_data(db, symbol, days)
+    
+    def _get_db_market_data(self, db: Session, symbol: str, days: int) -> Dict[str, Dict]:
+        """Get historical data from database"""
+        cutoff_date = datetime.now() - timedelta(days=days)
+        
+        data = db.query(MarketData).filter(
+            MarketData.symbol == symbol,
+            MarketData.date >= cutoff_date
+        ).order_by(MarketData.date).all()
+        
+        results = {}
+        for row in data:
+            date_str = row.date.strftime("%Y-%m-%d")
+            results[date_str] = {
+                "open": row.open,
+                "high": row.high,
+                "low": row.low,
+                "close": row.close,
+                "volume": row.volume,
+                "adjusted_close": row.adjusted_close
+            }
+        
+        return results
+    
+    async def _get_current_prices(self, db: Session, symbols: List[str]) -> Dict[str, float]:
+        """Get current prices using Finnhub with DB fallback"""
         prices = {}
+        
         for symbol in symbols:
             try:
-                ticker = yf.Ticker(symbol)
-                hist = ticker.history(period="2d")
-                if not hist.empty:
-                    prices[symbol] = float(hist['Close'].iloc[-1])
+                price = await self.market_data_service.get_latest_price(symbol)
+                if price is not None:
+                    prices[symbol] = price
+                    continue
             except Exception as e:
-                print(f"Error fetching price for {symbol}: {e}")
-                prices[symbol] = 100.0  # Fallback
+                print(f"Finnhub error for {symbol}: {e}")
+            
+            # Fallback to database
+            latest_price = db.query(
+                MarketData.close
+            ).filter(
+                MarketData.symbol == symbol
+            ).order_by(
+                MarketData.date.desc()
+            ).first()
+            
+            if latest_price:
+                prices[symbol] = latest_price[0]
+            else:
+                print(f"No price data available for {symbol}")
+        
         return prices
+
+    # Update other methods to use these new methods
+    def _calculate_correlation(self, db: Session, symbol1: str, symbol2: str) -> float:
+        """Calculate correlation using Finnhub data with DB fallback"""
+        try:
+            data1 = self._get_historical_prices(db, symbol1)
+            data2 = self._get_historical_prices(db, symbol2)
+            
+            # Align dates
+            common_dates = sorted(set(data1.keys()) & set(data2.keys()))
+            if len(common_dates) < 20:
+                return 0.0
+                
+            returns1 = []
+            returns2 = []
+            
+            for i in range(1, len(common_dates)):
+                r1 = (data1[common_dates[i]]["close"] / data1[common_dates[i-1]]["close"]) - 1
+                r2 = (data2[common_dates[i]]["close"] / data2[common_dates[i-1]]["close"]) - 1
+                returns1.append(r1)
+                returns2.append(r2)
+            
+            if not returns1 or not returns2:
+                return 0.0
+                
+            correlation = np.corrcoef(returns1, returns2)[0, 1]
+            return float(correlation) if not np.isnan(correlation) else 0.0
+            
+        except Exception as e:
+            print(f"Error calculating correlation: {e}")
+            return 0.0
     
-    def _calculate_sharpe_ratio(self, returns: np.ndarray) -> float:
+    async def _calculate_sharpe_ratio(self, returns: np.ndarray) -> float:
         """REAL Sharpe Ratio: (Portfolio Return - Risk Free Rate) / Portfolio Volatility"""
         if len(returns) == 0:
             return 0.0
@@ -148,15 +257,14 @@ class AnalyticsEngine:
         
         sharpe = (annual_return - self.risk_free_rate) / annual_volatility
         return round(float(sharpe), 3)
-    
-    def _calculate_alpha(self, returns: np.ndarray, portfolio_id: int) -> float:
+
+    async def _calculate_alpha(self, returns: np.ndarray, portfolio_id: int) -> float:
         """REAL Jensen's Alpha: Portfolio Return - [Risk Free Rate + Beta * (Market Return - Risk Free Rate)]"""
         if len(returns) == 0:
             return 0.0
         
         try:
-            # Get market returns for same period
-            market_returns = self._get_market_returns(len(returns))
+            market_returns = await self._get_market_returns(len(returns))
             
             if len(market_returns) != len(returns):
                 return 0.0
@@ -178,20 +286,20 @@ class AnalyticsEngine:
         except Exception as e:
             print(f"Error calculating alpha: {e}")
             return 0.0
-    
-    def _calculate_beta(self, returns: np.ndarray) -> float:
+
+    async def _calculate_beta(self, returns: np.ndarray) -> float:
         """REAL Beta: Covariance(Portfolio, Market) / Variance(Market)"""
         if len(returns) == 0:
             return 1.0
         
         try:
-            market_returns = self._get_market_returns(len(returns))
-            return self._calculate_beta_with_market(returns, market_returns)
+            market_returns = await self._get_market_returns(len(returns))
+            return await self._calculate_beta_with_market(returns, market_returns)
         except Exception as e:
             print(f"Error calculating beta: {e}")
             return 1.0
     
-    def _calculate_beta_with_market(self, portfolio_returns: np.ndarray, market_returns: np.ndarray) -> float:
+    async def _calculate_beta_with_market(self, portfolio_returns: np.ndarray, market_returns: np.ndarray) -> float:
         """Calculate beta using actual market data"""
         if len(portfolio_returns) != len(market_returns) or len(portfolio_returns) == 0:
             return 1.0
@@ -207,7 +315,7 @@ class AnalyticsEngine:
         beta = covariance / market_variance
         return round(float(beta), 3)
     
-    def _get_market_returns(self, num_days: int) -> np.ndarray:
+    async def _get_market_returns(self, num_days: int) -> np.ndarray:
         """Get actual market returns (S&P 500) for the last num_days"""
         try:
             # Get market data
@@ -230,12 +338,11 @@ class AnalyticsEngine:
             
             # Return the most recent num_days returns
             return np.array(market_returns[-num_days:])
-            
         except Exception as e:
             print(f"Error getting market returns: {e}")
             return np.array([])
     
-    def _calculate_volatility(self, returns: np.ndarray) -> float:
+    async def _calculate_volatility(self, returns: np.ndarray) -> float:
         """REAL Volatility: Standard deviation of returns, annualized"""
         if len(returns) == 0:
             return 0.0
@@ -248,8 +355,8 @@ class AnalyticsEngine:
         
         # Convert to percentage
         return round(float(annualized_volatility * 100), 2)
-    
-    def _calculate_max_drawdown(self, returns: np.ndarray) -> float:
+
+    async def _calculate_max_drawdown(self, returns: np.ndarray) -> float:
         """REAL Max Drawdown: Maximum peak-to-trough decline"""
         if len(returns) == 0:
             return 0.0
@@ -268,8 +375,8 @@ class AnalyticsEngine:
         
         # Convert to positive percentage
         return round(float(abs(max_drawdown) * 100), 2)
-    
-    def _calculate_sortino_ratio(self, returns: np.ndarray) -> float:
+
+    async def _calculate_sortino_ratio(self, returns: np.ndarray) -> float:
         """REAL Sortino Ratio: (Portfolio Return - Risk Free Rate) / Downside Deviation"""
         if len(returns) == 0:
             return 0.0
@@ -293,7 +400,7 @@ class AnalyticsEngine:
         
         sortino = (annual_return - self.risk_free_rate) / downside_deviation
         return round(float(sortino), 3)
-    
+
     def _calculate_symbol_correlation(self, symbol1: str, symbol2: str) -> float:
         """REAL Correlation: Calculate actual price correlation between two symbols"""
         try:
@@ -336,7 +443,7 @@ class AnalyticsEngine:
             print(f"Error calculating correlation between {symbol1} and {symbol2}: {e}")
             return 0.0
     
-    def calculate_sector_allocation(self, db: Session, user_id: int) -> List[SectorAllocation]:
+    async def calculate_sector_allocation(self, db: Session, user_id: int) -> List[SectorAllocation]:
         """REAL sector allocation from actual holdings"""
         portfolio = db.query(Portfolio).filter(Portfolio.user_id == user_id).first()
         if not portfolio:
@@ -352,7 +459,7 @@ class AnalyticsEngine:
         
         # Get current prices for all holdings
         symbols = [h.symbol for h in holdings]
-        current_prices = self._get_current_prices(symbols)
+        current_prices = await self._get_current_prices(db, symbols)
         
         for holding in holdings:
             current_price = current_prices.get(holding.symbol, holding.current_price)
@@ -378,7 +485,7 @@ class AnalyticsEngine:
         
         return sorted(allocation, key=lambda x: x.percentage, reverse=True)
     
-    def calculate_correlation_matrix(self, db: Session, user_id: int) -> Optional[CorrelationMatrix]:
+    async def calculate_correlation_matrix(self, db: Session, user_id: int) -> Optional[CorrelationMatrix]:
         """REAL correlation matrix using actual price correlations"""
         portfolio = db.query(Portfolio).filter(Portfolio.user_id == user_id).first()
         if not portfolio:
@@ -405,7 +512,7 @@ class AnalyticsEngine:
         
         return CorrelationMatrix(symbols=symbols, matrix=matrix)
     
-    def calculate_diversification_score(self, db: Session, user_id: int) -> float:
+    async def calculate_diversification_score(self, db: Session, user_id: int) -> float:
         """REAL diversification score using current market values"""
         portfolio = db.query(Portfolio).filter(Portfolio.user_id == user_id).first()
         if not portfolio:
@@ -417,7 +524,8 @@ class AnalyticsEngine:
         
         # Use REAL current market values
         symbols = [h.symbol for h in holdings]
-        current_prices = self._get_current_prices(symbols)
+        # Fix: Add await here
+        current_prices = await self._get_current_prices(db, symbols)
         
         total_value = 0
         market_values = []
